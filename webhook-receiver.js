@@ -10,6 +10,7 @@
  */
 
 require("dotenv").config();
+console.log("ZOHO_IN_CLIENT_ID present:", !!process.env.ZOHO_IN_CLIENT_ID);
 const express = require("express");
 const axios = require("axios");
 const app = express();
