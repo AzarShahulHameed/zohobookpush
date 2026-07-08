@@ -8,6 +8,12 @@
  * invoice_pushed field, since People's updateRecord endpoint returns a
  * persistent 7201 error and could not be made to work).
  *
+ * If an invoice already exists but the project's current project_revenue
+ * no longer matches the invoiced total (e.g. someone corrected the amount
+ * after the invoice was created), this is logged loudly as a MISMATCH and
+ * counted as a failure - it is NEVER auto-corrected. A human must decide
+ * whether to issue a credit note, a new invoice, or a manual adjustment.
+ *
  * SECONDARY mechanism: webhook endpoint kept as a dormant fallback in case
  * the Zoho-side workflow trigger issue ever gets resolved. Not relied on.
  *
@@ -161,14 +167,37 @@ async function resolveCurrencyId(currencyCode, config) {
   return match.currency_id;
 }
 
-// ---- Dedup check: does a Books invoice already exist for this project? ----
-async function invoiceAlreadyExists(project, config) {
+// ---- Dedup + reconciliation check ----
+// Returns { exists: bool, amountMismatch: bool, existingInvoice: obj|null }
+// If exists=true, the caller must NOT push a new invoice - dedup by
+// reference_number (the People record ID) is authoritative.
+// If amountMismatch=true, the current project_revenue no longer matches
+// what was actually invoiced. This is logged loudly and never auto-fixed.
+async function checkExistingInvoice(project, config) {
   const accessToken = await getAccessToken(config.dc, config.clientId, config.clientSecret, config.refreshToken);
   const resp = await axios.get(
     `https://www.zohoapis.${config.dc}/books/v3/invoices?organization_id=${config.orgId}&reference_number=${project._recordId}`,
     { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } }
   );
-  return resp.data.invoices && resp.data.invoices.length > 0;
+  const invoices = resp.data.invoices || [];
+  if (invoices.length === 0) {
+    return { exists: false, amountMismatch: false, existingInvoice: null };
+  }
+
+  const existing = invoices[0];
+  const currentRevenue = Number(project.project_revenue) || 0;
+  const amountMismatch = Math.abs(existing.total - currentRevenue) > 0.01;
+
+  if (amountMismatch) {
+    console.warn(
+      `MISMATCH: Project ${project._recordId} (${project.Project_Name}) has invoice ` +
+      `${existing.invoice_number} for ${existing.total}, but current project_revenue is ` +
+      `${currentRevenue}. NOT auto-correcting. Review manually - possible credit note or ` +
+      `new invoice needed.`
+    );
+  }
+
+  return { exists: true, amountMismatch, existingInvoice: existing };
 }
 
 // ---- Invoice numbering (16-char limit, manual numbering org) ----
@@ -217,6 +246,7 @@ async function pollAndPushFixedInvoices() {
   console.log(`[${new Date().toISOString()}] Starting poll cycle...`);
   let processed = 0;
   let failed = 0;
+  let mismatches = 0;
 
   const allProjects = await getAllProjects();
 
@@ -229,8 +259,12 @@ async function pollAndPushFixedInvoices() {
     if (!config) continue;
 
     try {
-      const alreadyInvoiced = await invoiceAlreadyExists(project, config);
-      if (alreadyInvoiced) continue;
+      const check = await checkExistingInvoice(project, config);
+
+      if (check.exists) {
+        if (check.amountMismatch) mismatches++;
+        continue; // never re-push, never auto-correct
+      }
 
       console.log(`Pushing invoice for ${project._recordId} (${project.Project_Name})`);
       const invoice = await pushFixedInvoice(project);
@@ -243,7 +277,7 @@ async function pollAndPushFixedInvoices() {
     }
   }
 
-  console.log(`Poll cycle complete. Pushed: ${processed}, Failed: ${failed}`);
+  console.log(`Poll cycle complete. Pushed: ${processed}, Failed: ${failed}, Mismatches flagged: ${mismatches}`);
 }
 
 // ---- Dormant webhook endpoint (fallback) ----
@@ -262,8 +296,14 @@ app.post("/webhook/project-completed", async (req, res) => {
     const config = BOOKS_CONFIG[project.billing_entity];
     if (!config) throw new Error(`No Books config for entity: "${project.billing_entity}"`);
 
-    const alreadyInvoiced = await invoiceAlreadyExists(project, config);
-    if (alreadyInvoiced) return res.status(200).send("Already invoiced");
+    const check = await checkExistingInvoice(project, config);
+    if (check.exists) {
+      return res.status(200).send(
+        check.amountMismatch
+          ? `Already invoiced (${check.existingInvoice.invoice_number}) but amount MISMATCH - review manually.`
+          : "Already invoiced."
+      );
+    }
 
     const invoice = await pushFixedInvoice(project);
     res.status(200).send(`Invoice ${invoice.invoice_number} created as draft`);
