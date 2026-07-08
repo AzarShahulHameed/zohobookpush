@@ -211,6 +211,58 @@ app.post("/webhook/project-completed", async (req, res) => {
   res.status(500).send(detail);
 }
 });
+async function pollAndPushFixedInvoices() {
+  console.log(`[${new Date().toISOString()}] Starting poll cycle...`);
+  const accessToken = await getAccessToken("in", PEOPLE_CLIENT_ID, PEOPLE_CLIENT_SECRET, PEOPLE_REFRESH_TOKEN);
+  const url = `https://people.zoho.in/people/api/forms/P_TimesheetJobsList/getRecords`;
+
+  let sIndex = 1;
+  const pageSize = 200;
+  let processed = 0;
+
+  while (true) {
+    const resp = await axios.get(url, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      params: { sIndex, limit: pageSize },
+    });
+
+    const result = resp.data.response.result;
+    if (!result || !Array.isArray(result) || result.length === 0) break;
+
+    for (const item of result) {
+      const [recordId, arr] = Object.entries(item)[0];
+      const project = arr[0];
+      project._recordId = recordId;
+
+      const isCompleted = project.Status === "Completed" || project.status1 === "Completed";
+      const isFixed = project.billing_model === "Fixed Billing";
+      const notPushed = project.invoice_pushed !== "true" && project.invoice_pushed !== true;
+
+      if (isCompleted && isFixed && notPushed) {
+        try {
+          console.log(`Pushing invoice for project ${recordId} (${project.Project_Name})`);
+          const invoice = await pushFixedInvoice(project);
+          await markInvoicePushed(recordId);
+          console.log(`Success: ${invoice.invoice_number}`);
+          processed++;
+        } catch (err) {
+          const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+          console.error(`Failed for ${recordId}:`, detail);
+        }
+      }
+    }
+
+    if (result.length < pageSize) break;
+    sIndex += pageSize;
+  }
+
+  console.log(`Poll cycle complete. Processed: ${processed}`);
+}
+
+// Run every 5 minutes
+setInterval(pollAndPushFixedInvoices, 5 * 60 * 1000);
+// Also run once on startup
+pollAndPushFixedInvoices().catch(err => console.error("Initial poll failed:", err.message));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Webhook receiver listening on port ${PORT}`));
