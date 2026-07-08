@@ -2,15 +2,17 @@
  * People -> Books invoice automation for Fixed Billing projects.
  *
  * PRIMARY mechanism: polling. Every 5 minutes, scans all Projects records,
- * finds ones where Status=Completed, Billing Model=Fixed Billing,
- * Invoice Pushed=False, and pushes a draft invoice for each.
+ * finds ones where Status=Completed and Billing Model=Fixed Billing,
+ * and pushes a draft invoice for each - UNLESS a Books invoice already
+ * exists for that project (checked via reference_number, not People's
+ * invoice_pushed field, since People's updateRecord endpoint returns a
+ * persistent 7201 error and could not be made to work).
  *
  * SECONDARY mechanism: webhook endpoint kept as a dormant fallback in case
  * the Zoho-side workflow trigger issue ever gets resolved. Not relied on.
  *
  * No hardcoded client-to-contact or currency mappings. Both are resolved
- * live against Books contacts on every run, with a short cache to avoid
- * hammering the API within one poll cycle.
+ * live against Books contacts on every run, with a short cache.
  *
  * Does NOT handle T&M (needs period-based billing, not status-triggered)
  * or Milestone (separate form, separate logic - not built yet).
@@ -43,8 +45,6 @@ const BOOKS_CONFIG = {
     clientSecret: process.env.ZOHO_US_CLIENT_SECRET,
     refreshToken: process.env.ZOHO_BOOKS_US_REFRESH_TOKEN,
   },
-  // Add "NoblQ Canada" here when that entity comes off hold - same shape,
-  // pointing at a .ca or whichever DC Canada's org actually lives on.
 };
 
 // ---- Token helper ----
@@ -94,22 +94,9 @@ async function getAllProjects() {
   return all;
 }
 
-// ---- Zoho People: mark invoice_pushed = true ----
-async function markInvoicePushed(recordId) {
-  const accessToken = await getAccessToken("in", PEOPLE_CLIENT_ID, PEOPLE_CLIENT_SECRET, PEOPLE_REFRESH_TOKEN);
-  const url = `https://people.zoho.in/people/api/forms/P_TimesheetJobsList/updateRecord`;
-  await axios.post(url, null, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-    params: {
-      recordId,
-      inputData: JSON.stringify({ invoice_pushed: true }),
-    },
-  });
-}
-
 // ---- Books contacts cache (per org, short-lived) ----
 const contactsCache = {};
-const CACHE_TTL_MS = 4 * 60 * 1000; // slightly under the 5-min poll interval
+const CACHE_TTL_MS = 4 * 60 * 1000;
 
 async function getAllContacts(config) {
   const cacheKey = config.orgId;
@@ -137,7 +124,7 @@ async function getAllContacts(config) {
   return allContacts;
 }
 
-// ---- Dynamic customer_id resolution — EXACT match only, no fuzzy/partial matching ----
+// ---- Dynamic customer_id resolution — EXACT match only ----
 async function resolveCustomerId(clientName, config) {
   if (!clientName) throw new Error("Project has no Client Name set.");
   const contacts = await getAllContacts(config);
@@ -161,21 +148,30 @@ async function resolveCustomerId(clientName, config) {
   return matches[0].contact_id;
 }
 
-// ---- Dynamic currency_id resolution — derived from any existing contact using that currency ----
+// ---- Dynamic currency_id resolution ----
 async function resolveCurrencyId(currencyCode, config) {
   if (!currencyCode) throw new Error("Project has no Currency set.");
   const contacts = await getAllContacts(config);
   const match = contacts.find(c => c.currency_code === currencyCode);
   if (!match) {
     throw new Error(
-      `No existing Books contact in org ${config.orgId} uses currency "${currencyCode}", ` +
-      `so currency_id can't be derived automatically.`
+      `No existing Books contact in org ${config.orgId} uses currency "${currencyCode}".`
     );
   }
   return match.currency_id;
 }
 
-// ---- Invoice numbering (org has manual numbering enabled; 16-char limit) ----
+// ---- Dedup check: does a Books invoice already exist for this project? ----
+async function invoiceAlreadyExists(project, config) {
+  const accessToken = await getAccessToken(config.dc, config.clientId, config.clientSecret, config.refreshToken);
+  const resp = await axios.get(
+    `https://www.zohoapis.${config.dc}/books/v3/invoices?organization_id=${config.orgId}&reference_number=${project._recordId}`,
+    { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } }
+  );
+  return resp.data.invoices && resp.data.invoices.length > 0;
+}
+
+// ---- Invoice numbering (16-char limit, manual numbering org) ----
 function generateInvoiceNumber() {
   const now = Date.now().toString(36).toUpperCase();
   return `INV-${now}`;
@@ -199,6 +195,7 @@ async function pushFixedInvoice(project) {
     customer_id: customerId,
     invoice_number: generateInvoiceNumber(),
     currency_id: currencyId,
+    reference_number: project._recordId,
     line_items: [
       {
         name: `${project.Project_Name} - Fixed Billing`,
@@ -215,7 +212,7 @@ async function pushFixedInvoice(project) {
   return resp.data.invoice;
 }
 
-// ---- Poll cycle: scan all projects, push what's ready ----
+// ---- Poll cycle ----
 async function pollAndPushFixedInvoices() {
   console.log(`[${new Date().toISOString()}] Starting poll cycle...`);
   let processed = 0;
@@ -226,14 +223,17 @@ async function pollAndPushFixedInvoices() {
   for (const project of allProjects) {
     const isCompleted = project.Status === "Completed" || project.status1 === "Completed";
     const isFixed = project.billing_model === "Fixed Billing";
-    const notPushed = project.invoice_pushed !== "true" && project.invoice_pushed !== true;
+    if (!(isCompleted && isFixed)) continue;
 
-    if (!(isCompleted && isFixed && notPushed)) continue;
+    const config = BOOKS_CONFIG[project.billing_entity];
+    if (!config) continue;
 
     try {
+      const alreadyInvoiced = await invoiceAlreadyExists(project, config);
+      if (alreadyInvoiced) continue;
+
       console.log(`Pushing invoice for ${project._recordId} (${project.Project_Name})`);
       const invoice = await pushFixedInvoice(project);
-      await markInvoicePushed(project._recordId);
       console.log(`  -> Success: ${invoice.invoice_number}`);
       processed++;
     } catch (err) {
@@ -246,7 +246,7 @@ async function pollAndPushFixedInvoices() {
   console.log(`Poll cycle complete. Pushed: ${processed}, Failed: ${failed}`);
 }
 
-// ---- Dormant webhook endpoint (fallback, not currently relied upon) ----
+// ---- Dormant webhook endpoint (fallback) ----
 app.post("/webhook/project-completed", async (req, res) => {
   const zohoId = req.query.Zoho_ID || req.body.Zoho_ID;
   if (!zohoId) return res.status(400).send("Missing Zoho_ID");
@@ -255,16 +255,17 @@ app.post("/webhook/project-completed", async (req, res) => {
     const allProjects = await getAllProjects();
     const project = allProjects.find(p => p._recordId === String(zohoId));
     if (!project) throw new Error(`No project found for Zoho_ID ${zohoId}`);
-
-    if (project.invoice_pushed === "true" || project.invoice_pushed === true) {
-      return res.status(200).send("Already invoiced");
-    }
     if (project.billing_model !== "Fixed Billing") {
       return res.status(200).send("Not Fixed Billing, skipped");
     }
 
+    const config = BOOKS_CONFIG[project.billing_entity];
+    if (!config) throw new Error(`No Books config for entity: "${project.billing_entity}"`);
+
+    const alreadyInvoiced = await invoiceAlreadyExists(project, config);
+    if (alreadyInvoiced) return res.status(200).send("Already invoiced");
+
     const invoice = await pushFixedInvoice(project);
-    await markInvoicePushed(zohoId);
     res.status(200).send(`Invoice ${invoice.invoice_number} created as draft`);
   } catch (err) {
     const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
